@@ -1,3 +1,4 @@
+
 import setuptools
 
 exec(open("nomadnet/_version.py", "r").read())
@@ -30,6 +31,6 @@ setuptools.setup(
     entry_points= {
         'console_scripts': ['nomadnet=nomadnet.nomadnet:main']
     },
-    install_requires=["rns>=0.9.6", "lxmf>=0.7.1", "urwid>=2.6.16", "qrcode", "gpiozero", "smbus", "spidev", "lgpio", "numpy", "pillow", "arrow", "readchar"],
+    install_requires=["rns>=1.1.3", "lxmf>=0.9.4", "urwid>=2.6.16", "qrcode", "gpiozero", "smbus", "spidev", "lgpio", "numpy", "pillow", "arrow", "readchar"],
     python_requires=">=3.7",
 )

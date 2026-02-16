@@ -1455,6 +1455,36 @@ This line will
 ``
 
 
+>Partials
+
+You can include partials in pages, which will load asynchronously once the page itself has loaded. 
+
+`Faaa
+`=
+`{f64a846313b874ee4a357040807f8c77:/page/partial_1.mu}
+`=
+``
+
+It's also possible to set an auto-refresh interval for partials. Omit or set to 0 to disable. The following partial will update every 10 seconds.
+
+`Faaa
+`=
+`{f64a846313b874ee4a357040807f8c77:/page/refreshing_partial.mu`10}
+`=
+``
+
+You can include field values and variables in partial updates, and by setting the `!pid`! variable, you can create links that update one or more specific partials.
+
+`Faaa
+`=
+Name: `B444`<user_name`>`b
+
+`F38a`[Say hello`p:32]`f
+
+`{f64a846313b874e84a357039807f8c77:/page/hello_partial.mu`0`pid=32|user_name}
+`=
+``
+
 >Literals
 
 To display literal content, for example source-code, or blocks of text that should not be interpreted by micron, you can use literal blocks, specified by the \\`= tag. Below is the source code of this entire document, presented as a literal block.

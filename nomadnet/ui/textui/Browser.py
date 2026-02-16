@@ -8,9 +8,11 @@ import shutil
 import nomadnet
 import subprocess
 import threading
+from threading import Lock
 from .MicronParser import markup_to_attrmaps, make_style, default_state
 from nomadnet.Directory import DirectoryEntry
 from nomadnet.vendor.Scrollable import *
+from nomadnet.util import strip_modifiers
 
 class BrowserFrame(urwid.Frame):
     def keypress(self, size, key):
@@ -36,19 +38,20 @@ class BrowserFrame(urwid.Frame):
                     if hasattr(self.delegate, "page_pile") and self.delegate.page_pile:
                         def df(loop, user_data):
                             st = None
-                            nf = self.delegate.page_pile.focus
-                            if hasattr(nf, "key_timeout"):
-                                st = nf
-                            elif hasattr(nf, "original_widget"):
-                                no = nf.original_widget
-                                if hasattr(no, "original_widget"):
-                                    st = no.original_widget
-                                else:
-                                    if hasattr(no, "key_timeout"):
-                                        st = no
-                        
-                            if st and hasattr(st, "key_timeout") and hasattr(st, "keypress") and callable(st.keypress):
-                                st.keypress(None, None)
+                            if self.delegate.page_pile:
+                                nf = self.delegate.page_pile.focus
+                                if hasattr(nf, "key_timeout"):
+                                    st = nf
+                                elif hasattr(nf, "original_widget"):
+                                    no = nf.original_widget
+                                    if hasattr(no, "original_widget"):
+                                        st = no.original_widget
+                                    else:
+                                        if hasattr(no, "key_timeout"):
+                                            st = no
+                            
+                                if st and hasattr(st, "key_timeout") and hasattr(st, "keypress") and callable(st.keypress):
+                                    st.keypress(None, None)
 
                         nomadnet.NomadNetworkApp.get_shared_instance().ui.loop.set_alarm_in(0.25, df)
                 
@@ -111,6 +114,9 @@ class Browser:
         self.frame = None
         self.attr_maps = []
         self.page_pile = None
+        self.page_partials = {}
+        self.updater_running = False
+        self.partial_updater_lock = Lock()
         self.build_display()
 
         self.history = []
@@ -179,6 +185,7 @@ class Browser:
             return destination_type
 
     def handle_link(self, link_target, link_data = None):
+        partial_ids = None
         request_data = None
         if link_data != None:
             link_fields = []
@@ -229,12 +236,6 @@ class Browser:
                                 else:
                                     pass  # do nothing if checkbox is not check
 
-
-
-
-                        
-
-                
             recurse_down(self.attr_maps)
             RNS.log("Including request data: "+str(request_data), RNS.LOG_DEBUG)
 
@@ -244,6 +245,10 @@ class Browser:
         if len(components) == 2:
             destination_type = self.expand_shorthands(components[0])
             link_target = components[1]
+        elif link_target.startswith("p:"):
+            comps = link_target.split(":")
+            if len(comps) > 1: partial_ids = comps[1:]
+            destination_type = "partial"
         else:
             destination_type = "nomadnetwork.node"
             link_target = components[0]
@@ -263,6 +268,9 @@ class Browser:
         elif destination_type == "lxmf.delivery":
             RNS.log("Passing LXMF link to handler", RNS.LOG_DEBUG)
             self.handle_lxmf_link(link_target)
+
+        elif destination_type == "partial":
+            if partial_ids != None and len(partial_ids) > 0: self.handle_partial_updates(partial_ids)
 
         else:
             RNS.log("No known handler for destination type "+str(destination_type), RNS.LOG_DEBUG)
@@ -317,6 +325,7 @@ class Browser:
         self.browser_footer = urwid.Text("")
 
         self.page_pile = None
+        self.page_partials = {}
         self.browser_body = urwid.Filler(
             urwid.Text("Disconnected\n"+self.g["arrow_l"]+"  "+self.g["arrow_r"], align=urwid.CENTER),
             urwid.MIDDLE,
@@ -373,6 +382,7 @@ class Browser:
         if self.status == Browser.DISCONECTED:
             self.display_widget.set_attr_map({None: "inactive_text"})
             self.page_pile = None
+            self.page_partials = {}
             self.browser_body = urwid.Filler(
                 urwid.Text("Disconnected\n"+self.g["arrow_l"]+"  "+self.g["arrow_r"], align=urwid.CENTER),
                 urwid.MIDDLE,
@@ -446,7 +456,234 @@ class Browser:
         pile = urwid.Pile(self.attr_maps)
         pile.automove_cursor_on_scroll = True
         self.page_pile = pile
+        self.page_partials = {}
         self.browser_body = urwid.AttrMap(ScrollBar(Scrollable(pile, force_forward_keypress=True), thumb_char="\u2503", trough_char=" "), "scrollbar")
+        self.detect_partials()
+
+    def parse_url(self, url):
+        path = None
+        destination_hash = None
+        components = url.split(":")
+        if len(components) == 1:
+            if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
+                path = Browser.DEFAULT_PATH
+            else: raise ValueError("Malformed URL")
+        elif len(components) == 2:
+            if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
+                path = components[1]
+                if len(path) == 0: path = Browser.DEFAULT_PATH
+            else:
+                if len(components[0]) == 0:
+                    if self.destination_hash != None:
+                        destination_hash = self.destination_hash
+                        path = components[1]
+                        if len(path) == 0: path = Browser.DEFAULT_PATH
+                    else: raise ValueError("Malformed URL")
+                else: raise ValueError("Malformed URL")
+        else: raise ValueError("Malformed URL")
+
+        return destination_hash, path
+
+    def detect_partials(self):
+        for w in self.attr_maps:
+            o = w._original_widget
+            if hasattr(o, "partial_hash"):
+                RNS.log(f"Found partial: {o.partial_hash} / {o.partial_url} / {o.partial_refresh}")
+                partial = {"hash": o.partial_hash, "id": o.partial_id, "url": o.partial_url, "fields": o.partial_fields,
+                           "refresh": o.partial_refresh, "content": None, "updated": None, "update_requested": None, "request_id": None,
+                            "destination": None, "link": None, "pile": o, "attr_maps": None, "failed": False, "pr_throttle": 0}
+
+                self.page_partials[o.partial_hash] = partial
+
+        if len(self.page_partials) > 0: self.start_partial_updater()
+
+    def partial_failed(self, request_receipt):
+        RNS.log("Loading page partial failed", RNS.LOG_ERROR)
+        for pid in self.page_partials:
+            partial = self.page_partials[pid]
+            if partial["request_id"] == request_receipt.request_id:
+                try:
+                    partial["updated"] = time.time()
+                    partial["request_id"] = None
+                    partial["content"] = None
+                    partial["attr_maps"] = None
+                    url = partial["url"]
+                    pile = partial["pile"]
+                    pile.contents = [(urwid.Text(f"Could not load partial {url}: The resource transfer failed"), pile.options())]
+                except Exception as e:
+                    RNS.log(f"Error in partial failed callback: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+
+    def partial_progressed(self, request_receipt):
+        pass
+
+    def partial_received(self, request_receipt):
+        for pid in self.page_partials:
+            partial = self.page_partials[pid]
+            if partial["request_id"] == request_receipt.request_id:
+                try:
+                    partial["updated"] = partial["update_requested"]
+                    partial["request_id"] = None
+                    partial["content"] = request_receipt.response.decode("utf-8").rstrip()
+                    partial["attr_maps"] = markup_to_attrmaps(strip_modifiers(partial["content"]), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+                    pile = partial["pile"]
+                    pile.contents = [(e, pile.options()) for e in partial["attr_maps"]]
+
+                except Exception as e:
+                    RNS.trace_exception(e)
+
+    def __load_partial(self, partial):
+        if partial["failed"] == True: return
+        try: partial_destination_hash, path = self.parse_url(partial["url"])
+        except Exception as e:
+            RNS.log(f"Could not parse partial URL: {e}", RNS.LOG_ERROR)
+            partial["failed"] = True
+            pile = partial["pile"]
+            url = partial["url"]
+            pile.contents = [(urwid.Text(f"Could not load partial {url}: {e}"), pile.options())]
+            return
+
+        if partial_destination_hash != self.loopback and not RNS.Transport.has_path(partial_destination_hash):
+            if time.time() <= partial["pr_throttle"]: return
+            else:
+                partial["pr_throttle"] = time.time()+15
+                RNS.log(f"Requesting path for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+                RNS.Transport.request_path(partial_destination_hash)
+                pr_time = time.time()+RNS.Transport.first_hop_timeout(partial_destination_hash)
+                while not RNS.Transport.has_path(partial_destination_hash):
+                    now = time.time()
+                    if now > pr_time+self.timeout: return
+                    time.sleep(0.25)
+
+        for pid in self.page_partials:
+            other_partial = self.page_partials[pid]
+            if other_partial["link"]:
+                existing_link = other_partial["link"]
+                if existing_link.destination.hash == partial_destination_hash and existing_link.status == RNS.Link.ACTIVE:
+                    RNS.log(f"Re-using existing link: {existing_link}", RNS.LOG_EXTREME)
+                    partial["link"] = existing_link
+                    break
+
+        if not partial["link"] or partial["link"].status == RNS.Link.CLOSED:
+            RNS.log(f"Establishing link for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+            identity = RNS.Identity.recall(partial_destination_hash)
+            destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, self.app_name, self.aspects)
+            
+            def established(link):
+                RNS.log(f"Link established for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+
+            def closed(link):
+                RNS.log(f"Link closed for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+                partial["link"] = None
+            
+            partial["link"] = RNS.Link(destination, established_callback = established, closed_callback = closed)
+            timeout = time.time()+self.timeout
+            while partial["link"].status != RNS.Link.ACTIVE and time.time() < timeout: time.sleep(0.1)
+
+        if partial["link"] and partial["link"].status == RNS.Link.ACTIVE and partial["request_id"] == None:
+            RNS.log(f"Sending request for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+            receipt = partial["link"].request(path, data=self.__get_partial_request_data(partial), response_callback = self.partial_received,
+                                              failed_callback = self.partial_failed, progress_callback = self.partial_progressed)
+
+            if receipt: partial["request_id"] = receipt.request_id
+            else: RNS.log(f"Partial request failed", RNS.LOG_ERROR)
+
+    def __get_partial_request_data(self, partial):
+        request_data = None
+        if partial["fields"] != None:
+            link_data = partial["fields"]
+            link_fields = []
+            request_data = {}
+            all_fields = True if "*" in link_data else False
+
+            for e in link_data:
+                if "=" in e:
+                    c = e.split("=")
+                    if len(c) == 2:
+                        request_data["var_"+str(c[0])] = str(c[1])
+                else:
+                    link_fields.append(e)
+
+                def recurse_down(w):
+                    if isinstance(w, list):
+                        for t in w:
+                            recurse_down(t)
+                    elif isinstance(w, tuple):
+                        for t in w:
+                            recurse_down(t)
+                    elif hasattr(w, "contents"):
+                        recurse_down(w.contents)
+                    elif hasattr(w, "original_widget"):
+                        recurse_down(w.original_widget)
+                    elif hasattr(w, "_original_widget"):
+                        recurse_down(w._original_widget)
+                    else:
+                        if hasattr(w, "field_name") and (all_fields or w.field_name in link_fields):
+                            field_key = "field_" + w.field_name
+                            if isinstance(w, urwid.Edit):
+                                request_data[field_key] = w.edit_text
+                            elif isinstance(w, urwid.RadioButton):
+                                if w.state:
+                                    user_data = getattr(w, "field_value", None)  
+                                    if user_data is not None:
+                                        request_data[field_key] = user_data
+                            elif isinstance(w, urwid.CheckBox):
+                                user_data = getattr(w, "field_value", "1")
+                                if w.state:
+                                    existing_value = request_data.get(field_key, '')
+                                    if existing_value:
+                                        # Concatenate the new value with the existing one
+                                        request_data[field_key] = existing_value + ',' + user_data
+                                    else:
+                                        # Initialize the field with the current value
+                                        request_data[field_key] = user_data
+                                else:
+                                    pass  # do nothing if checkbox is not check
+
+            recurse_down(self.attr_maps)
+            RNS.log("Including request data: "+str(request_data), RNS.LOG_DEBUG)
+
+        return request_data
+
+    def start_partial_updater(self):
+        if not self.updater_running: self.update_partials()
+
+    def handle_partial_updates(self, partial_ids):
+        RNS.log(f"Update partials: {partial_ids}")
+        def job():
+            for pid in self.page_partials:
+                try:
+                    partial = self.page_partials[pid]
+                    if partial["id"] in partial_ids:
+                        partial["update_requested"] = time.time()
+                        self.__load_partial(partial)
+                except Exception as e: RNS.log(f"Error updating page partial: {e}", RNS.LOG_ERROR)
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def update_partials(self, loop=None, user_data=None):
+        with self.partial_updater_lock:
+            def job():
+                for pid in self.page_partials:
+                    try:
+                        partial = self.page_partials[pid]
+                        if partial["failed"]: continue
+                        if not partial["updated"] or (partial["refresh"] != None and time.time() > partial["updated"]+partial["refresh"]):
+                            partial["update_requested"] = time.time()
+                            self.__load_partial(partial)
+                    except Exception as e: RNS.log(f"Error updating page partial: {e}", RNS.LOG_ERROR)
+
+            threading.Thread(target=job, daemon=True).start()
+            
+            if len(self.page_partials) > 0:
+                self.updater_running = True
+                self.app.ui.loop.set_alarm_in(1, self.update_partials)
+            else:
+                self.updater_running = False
 
     def identify(self):
         if self.link != None:
@@ -486,35 +723,25 @@ class Browser:
         components = url.split(":")
         if len(components) == 1:
             if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
-                try:
-                    destination_hash = bytes.fromhex(components[0])
-                except Exception as e:
-                    raise ValueError("Malformed URL")
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
                 path = Browser.DEFAULT_PATH
-            else:
-                raise ValueError("Malformed URL")
+            else: raise ValueError("Malformed URL")
         elif len(components) == 2:
             if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
-                try:
-                    destination_hash = bytes.fromhex(components[0])
-                except Exception as e:
-                    raise ValueError("Malformed URL")
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
                 path = components[1]
-                if len(path) == 0:
-                    path = Browser.DEFAULT_PATH
+                if len(path) == 0: path = Browser.DEFAULT_PATH
             else:
                 if len(components[0]) == 0:
                     if self.destination_hash != None:
                         destination_hash = self.destination_hash
                         path = components[1]
-                        if len(path) == 0:
-                            path = Browser.DEFAULT_PATH
-                    else:
-                        raise ValueError("Malformed URL")
-                else:
-                        raise ValueError("Malformed URL")
-        else:
-            raise ValueError("Malformed URL")
+                        if len(path) == 0: path = Browser.DEFAULT_PATH
+                    else: raise ValueError("Malformed URL")
+                else: raise ValueError("Malformed URL")
+        else: raise ValueError("Malformed URL")
 
         if destination_hash != None and path != None:
             if path.startswith("/file/"):
@@ -799,7 +1026,7 @@ class Browser:
             
             self.page_background_color = None
             bgpos = self.markup.find("#!bg=")
-            if bgpos:
+            if bgpos >= 0:
                 endpos = self.markup.find("\n", bgpos)
                 if endpos-(bgpos+5) == 3:
                     bg = self.markup[bgpos+5:endpos]
@@ -807,13 +1034,14 @@ class Browser:
 
             self.page_foreground_color = None
             fgpos = self.markup.find("#!fg=")
-            if fgpos:
+            if fgpos >= 0:
                 endpos = self.markup.find("\n", fgpos)
                 if endpos-(fgpos+5) == 3:
                     fg = self.markup[fgpos+5:endpos]
                     self.page_foreground_color = fg
 
-            self.attr_maps = markup_to_attrmaps(self.markup, url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+            try: self.attr_maps = markup_to_attrmaps(strip_modifiers(self.markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+            except Exception as e: self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render page: {e}"), "inactive_text")]
             
             self.response_progress = 0
             self.response_speed = None
@@ -853,7 +1081,7 @@ class Browser:
                         if "PATH" in os.environ:
                             env_map["PATH"] = os.environ["PATH"]
 
-                        generated = subprocess.run([page_path], stdout=subprocess.PIPE, env=env_map)
+                        generated = subprocess.run([page_path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env_map)
                         page_data = generated.stdout
                     else:
                         file = open(page_path, "rb")
@@ -866,7 +1094,7 @@ class Browser:
                 
                 self.page_background_color = None
                 bgpos = self.markup.find("#!bg=")
-                if bgpos:
+                if bgpos >= 0:
                     endpos = self.markup.find("\n", bgpos)
                     if endpos-(bgpos+5) == 3:
                         bg = self.markup[bgpos+5:endpos]
@@ -874,13 +1102,14 @@ class Browser:
 
                 self.page_foreground_color = None
                 fgpos = self.markup.find("#!fg=")
-                if fgpos:
+                if fgpos >= 0:
                     endpos = self.markup.find("\n", fgpos)
                     if endpos-(fgpos+5) == 3:
                         fg = self.markup[fgpos+5:endpos]
                         self.page_foreground_color = fg
 
-                self.attr_maps = markup_to_attrmaps(self.markup, url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+                try: self.attr_maps = markup_to_attrmaps(strip_modifiers(self.markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+                except Exception as e: self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render page: {e}"), "inactive_text")]
                 
                 self.response_progress = 0
                 self.response_speed = None
@@ -1018,7 +1247,7 @@ class Browser:
 
             self.page_background_color = None
             bgpos = self.markup.find("#!bg=")
-            if bgpos:
+            if bgpos >= 0:
                 endpos = self.markup.find("\n", bgpos)
                 if endpos-(bgpos+5) == 3:
                     bg = self.markup[bgpos+5:endpos]
@@ -1026,13 +1255,15 @@ class Browser:
 
             self.page_foreground_color = None
             fgpos = self.markup.find("#!fg=")
-            if fgpos:
+            if fgpos >= 0:
                 endpos = self.markup.find("\n", fgpos)
                 if endpos-(fgpos+5) == 3:
                     fg = self.markup[fgpos+5:endpos]
                     self.page_foreground_color = fg
 
-            self.attr_maps = markup_to_attrmaps(self.markup, url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+            try: self.attr_maps = markup_to_attrmaps(strip_modifiers(self.markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+            except Exception as e: self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render page: {e}"), "inactive_text")]
+
             self.response_progress = 0
             self.response_speed = None
             self.progress_updated_at = None
@@ -1160,6 +1391,8 @@ class Browser:
                         file_destination = self.app.downloads_path+"/"+file_name+"."+str(counter)
 
                     shutil.move(file_handle.name, file_destination)
+
+                    self.saved_file_name = file_destination.replace(self.app.downloads_path+"/", "", 1)
 
             else:
                 file_name = request_receipt.response[0]

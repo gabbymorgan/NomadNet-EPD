@@ -2,6 +2,7 @@ import nomadnet
 import urwid
 import random
 import time
+import RNS
 from urwid.util import is_mouse_press
 from urwid.text_layout import calc_coords
 
@@ -85,6 +86,54 @@ def markup_to_attrmaps(markup, url_delegate = None, fg_color=None, bg_color=None
 
     return attrmaps
 
+def parse_partial(line):
+    try:
+        endpos = line.find("}")
+        if endpos == -1: return None
+        else:
+            partial_data = line[0:endpos]
+
+            partial_id = None
+            partial_components = partial_data.split("`")
+            if len(partial_components) == 1:
+                partial_url = partial_components[0]
+                partial_refresh = None
+                partial_fields = ""
+            elif len(partial_components) == 2:
+                partial_url = partial_components[0]
+                partial_refresh = float(partial_components[1])
+                partial_fields = ""
+            elif len(partial_components) == 3:
+                partial_url = partial_components[0]
+                partial_refresh = float(partial_components[1])
+                partial_fields = partial_components[2]
+            else:
+                partial_url = ""
+                partial_fields = ""
+                partial_refresh = None
+
+            if partial_refresh != None and partial_refresh < 1: partial_refresh = None
+
+            pf = partial_fields.split("|")
+            if len(pf) > 0:
+                partial_fields = pf
+                for f in pf:
+                    if f.startswith("pid="):
+                        pcs = f.split("=")
+                        partial_id = pcs[1]
+
+            if len(partial_url):
+                pile = urwid.Pile([urwid.Text(f"⧖")])
+                partial_descriptor = "|".join(partial_components)
+                pile.partial_id = partial_id
+                pile.partial_hash = RNS.hexrep(RNS.Identity.full_hash(partial_descriptor.encode("utf-8")), delimit=False)
+                pile.partial_url = partial_url
+                pile.partial_fields = partial_fields
+                pile.partial_refresh = partial_refresh
+                return [pile]
+
+    except Exception as e: return None
+
 def parse_line(line, state, url_delegate):
     pre_escape = False
     if len(line) > 0:
@@ -97,6 +146,12 @@ def parse_line(line, state, url_delegate):
 
         # Only parse content if not in literal state
         if not state["literal"]:
+            # Apply markup sanitization
+            if first_char == ">" and "`<" in line:
+                # Remove heading status from lines containing fields
+                line = line.lstrip(">")
+                first_char = line[0]
+
             # Check if the command is an escape
             if first_char == "\\":
                 line = line[1:]
@@ -105,6 +160,10 @@ def parse_line(line, state, url_delegate):
             # Check for comments
             elif first_char == "#":
                 return None
+
+            # Check for partials
+            elif line.startswith("`{"):
+                return parse_partial(line[2:])
 
             # Check for section heading reset
             elif first_char == "<":
@@ -283,14 +342,11 @@ def make_style(state):
 
                 if color[0] == "g":
                     val = int(color[1:2])
-                    if val < 25:
-                        result = "black"
-                    elif val < 50:
-                        result = "dark gray"
-                    elif val < 75:
-                        result = "light gray"
-                    else:
-                        result = "white"
+                    if val < 25:   result = "black"
+                    elif val < 50: result = "dark gray"
+                    elif val < 75: result = "light gray"
+                    else:          result = "white"
+                
                 else:
                     r = int(color[0], 16)
                     g = int(color[1], 16)
@@ -298,65 +354,43 @@ def make_style(state):
 
                     if r == g == b:
                         val = int(color[0], 16)*6
-                        if val < 12:
-                            result = "black"
-                        elif val < 50:
-                            result = "dark gray"
-                        elif val < 80:
-                            result = "light gray"
-                        else:
-                            result = "white"
+                        if val < 12:   result = "black"
+                        elif val < 50: result = "dark gray"
+                        elif val < 80: result = "light gray"
+                        else:          result = "white"
 
                     else:
                         if r == b:
                             if r > g:
-                                if r > t:
-                                    result = "light magenta"
-                                else:
-                                    result = "dark magenta"
+                                if r > t: result = "light magenta"
+                                else:     result = "dark magenta"
                             else:
-                                if g > t:
-                                    result = "light green"
-                                else:
-                                    result = "dark green"
+                                if g > t: result = "light green"
+                                else:     result = "dark green"
                         if b == g:
                             if b > r:
-                                if b > t:
-                                    result = "light cyan"
-                                else:
-                                    result = "dark cyan"
+                                if b > t: result = "light cyan"
+                                else:     result = "dark cyan"
                             else:
-                                if r > t:
-                                    result = "light red"
-                                else:
-                                    result = "dark red"
+                                if r > t: result = "light red"
+                                else:     result = "dark red"
                         if g == r:
                             if g > b:
-                                if g > t:
-                                    result = "yellow"
-                                else:
-                                    result = "brown"
+                                if g > t: result = "yellow"
+                                else:     result = "brown"
                             else:
-                                if b > t:
-                                    result = "light blue"
-                                else:
-                                    result = "dark blue"
+                                if b > t: result = "light blue"
+                                else:     result = "dark blue"
 
                         if r > g and r > b:
-                            if r > t:
-                                result = "light red"
-                            else:
-                                result = "dark red"
+                            if r > t: result = "light red"
+                            else:     result = "dark red"
                         if g > r and g > b:
-                            if g > t:
-                                result = "light green"
-                            else:
-                                result = "dark green"
+                            if g > t: result = "light green"
+                            else:     result = "dark green"
                         if b > g and b > r:
-                            if b > t:
-                                result = "light blue"
-                            else:
-                                result = "dark blue"
+                            if b > t: result = "light blue"
+                            else:     result = "dark blue"
 
         except Exception as e:
             result = "default"
@@ -422,12 +456,9 @@ def make_style(state):
     bg        = state["bg_color"]
 
     format_string = ""
-    if bold:
-        format_string += ",bold"
-    if underline:
-        format_string += ",underline"
-    if italic:
-        format_string += ",italics"
+    if bold:      format_string += ",bold"
+    if underline: format_string += ",underline"
+    if italic:    format_string += ",italics"
 
     name = "micron_"+fg+"_"+bg+"_"+format_string
     if not name in SYNTH_STYLES:
@@ -487,20 +518,11 @@ def make_output(state, line, url_delegate, pre_escape=False):
                         state["bg_color"] = state["default_bg"]
                         state["align"] = state["default_align"]
                     elif c == "c":
-                        if state["align"] != "center":
-                            state["align"] = "center"
-                        else:
-                            state["align"] = state["default_align"]
+                        if state["align"] != "center": state["align"] = "center"
                     elif c == "l":
-                        if state["align"] != "left":
-                            state["align"] = "left"
-                        else:
-                            state["align"] = state["default_align"]
+                        if state["align"] != "left": state["align"] = "left"
                     elif c == "r":
-                        if state["align"] != "right":
-                            state["align"] = "right"
-                        else:
-                            state["align"] = state["default_align"]
+                        if state["align"] != "right": state["align"] = "right"
                     elif c == "a":
                         state["align"] = state["default_align"]
 
@@ -649,7 +671,7 @@ def make_output(state, line, url_delegate, pre_escape=False):
                                     orig_spec = speclist[4]
 
                                 if url_delegate != None:
-                                    linkspec = LinkSpec(link_url, orig_spec)
+                                    linkspec = LinkSpec(link_url, orig_spec, cm=cm)
                                     if link_fields != "":
                                         lf = link_fields.split("|")
                                         if len(lf) > 0:
@@ -657,9 +679,7 @@ def make_output(state, line, url_delegate, pre_escape=False):
 
                                     output.append((linkspec, link_label))
                                 else:
-                                    output.append(make_part(state, link_label)) 
-
-                                
+                                    output.append(make_part(state, link_label))
 
                     mode = "text"
                     if len(part) > 0:
@@ -696,11 +716,11 @@ def make_output(state, line, url_delegate, pre_escape=False):
 
 
 class LinkSpec(urwid.AttrSpec):
-    def __init__(self, link_target, orig_spec):
+    def __init__(self, link_target, orig_spec, cm=256):
         self.link_target = link_target
         self.link_fields = None
 
-        super().__init__(orig_spec.foreground, orig_spec.background)
+        super().__init__(orig_spec.foreground, orig_spec.background, colors=cm)
 
 
 class LinkableText(urwid.Text):

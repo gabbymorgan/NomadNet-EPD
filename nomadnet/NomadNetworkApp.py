@@ -245,8 +245,11 @@ class NomadNetworkApp:
                     self.peer_settings["served_file_requests"] = 0
 
             except Exception as e:
-                RNS.log("Could not load local peer settings from "+self.peersettingspath, RNS.LOG_ERROR)
-                RNS.log("The contained exception was: %s" % (str(e)), RNS.LOG_ERROR)
+                RNS.logdest = RNS.LOG_STDOUT
+                RNS.log(f"Could not load local peer settings from {self.peersettingspath}", RNS.LOG_ERROR)
+                RNS.log(f"The contained exception was: {e}", RNS.LOG_ERROR)
+                RNS.log(f"This likely means that the peer settings file has become corrupt.", RNS.LOG_ERROR)
+                RNS.log(f"You can try deleting the file at {self.peersettingspath} and restarting nomadnet.", RNS.LOG_ERROR)
                 nomadnet.panic()
         else:
             try:
@@ -558,9 +561,9 @@ class NomadNetworkApp:
         return self.message_router.get_outbound_propagation_node()
 
     def save_peer_settings(self):
-        file = open(self.peersettingspath, "wb")
-        file.write(msgpack.packb(self.peer_settings))
-        file.close()
+        tmp_path = f"{self.peersettingspath}.tmp"
+        with open(tmp_path, "wb") as file: file.write(msgpack.packb(self.peer_settings))
+        os.replace(tmp_path, self.peersettingspath)
 
     def lxmf_delivery(self, message):
         time_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(message.timestamp))
@@ -807,7 +810,7 @@ class NomadNetworkApp:
                             if not "intro_time" in self.config["textui"]:
                                 self.config["textui"]["intro_time"] = 1
                             else:
-                                self.config["textui"]["intro_time"] = self.config["textui"].as_int("intro_time")
+                                self.config["textui"]["intro_time"] = self.config["textui"].as_float("intro_time")
 
                             if not "intro_text" in self.config["textui"]:
                                 self.config["textui"]["intro_text"] = "Nomad Network"
